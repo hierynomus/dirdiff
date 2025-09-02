@@ -1,7 +1,10 @@
 use std::collections::HashSet;
-use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+
+use clap::Parser;
+use sha2::{Digest, Sha256};
 
 // ANSI color escape codes (no external crate needed)
 const RED: &str = "\x1b[31m";
@@ -48,19 +51,71 @@ fn direct_subdirs(root: &Path) -> HashSet<PathBuf> {
     dirs
 }
 
-fn print_diff(dir_a: &Path, dir_b: &Path) {
+/// Stream a file and return its SHA-256 digest.
+fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// Returns `Ok(true)` if file contents differ. Uses size check first, then SHA-256.
+fn contents_differ(a: &Path, b: &Path) -> io::Result<bool> {
+    let ma = fs::metadata(a)?;
+    let mb = fs::metadata(b)?;
+    if ma.len() != mb.len() {
+        return Ok(true);
+    }
+    Ok(hash_file(a)? != hash_file(b)?)
+}
+
+fn print_diff(dir_a: &Path, dir_b: &Path, check_hash: bool) {
     let files_a = collect_files(dir_a);
     let files_b = collect_files(dir_b);
 
+    // Missing files
     let mut missing_in_b: Vec<_> = files_a.difference(&files_b).cloned().collect();
     missing_in_b.sort();
 
     let mut missing_in_a: Vec<_> = files_b.difference(&files_a).cloned().collect();
     missing_in_a.sort();
 
-    if missing_in_a.is_empty() && missing_in_b.is_empty() {
-        println!("  {GREEN}✅ identical file sets{RESET}");
-        return;
+    // Common files (present in both) to check content equality (optional)
+    let mut changed: Vec<PathBuf> = Vec::new();
+    let mut errored: Vec<(PathBuf, String)> = Vec::new();
+
+    if check_hash {
+        let mut common: Vec<_> = files_a.intersection(&files_b).cloned().collect();
+        common.sort();
+        for rel in &common {
+            let pa = dir_a.join(rel);
+            let pb = dir_b.join(rel);
+            match contents_differ(&pa, &pb) {
+                Ok(true) => changed.push(rel.clone()),
+                Ok(false) => {},
+                Err(e) => errored.push((rel.clone(), e.to_string())),
+            }
+        }
+    }
+
+    let only_structure_equal = missing_in_a.is_empty() && missing_in_b.is_empty();
+
+    if !check_hash {
+        if only_structure_equal {
+            println!("  {GREEN}✅ identical file sets (skipped content check){RESET}");
+        }
+    } else if only_structure_equal && changed.is_empty() && errored.is_empty() {
+        println!("  {GREEN}✅ identical files and contents{RESET}");
     }
 
     if !missing_in_b.is_empty() {
@@ -84,17 +139,42 @@ fn print_diff(dir_a: &Path, dir_b: &Path) {
             println!("    {RED}{}{RESET}", p.display());
         }
     }
+
+    if check_hash && !changed.is_empty() {
+        println!("  {YELLOW}Files present in BOTH but with DIFFERENT CONTENT:{RESET}");
+        for p in &changed {
+            println!("    {RED}{}{RESET}", p.display());
+        }
+    }
+
+    if check_hash && !errored.is_empty() {
+        println!("  {YELLOW}Files that could not be compared (errors):{RESET}");
+        for (p, e) in &errored {
+            println!("    {RED}{} — {}{RESET}", p.display(), e);
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "dir_compare", version, about = "Compare directory structures (and optionally contents) by subdirectory.")]
+struct Cli {
+    /// First directory to compare
+    #[arg(value_name = "DIRECTORY_A")]
+    dir_a: PathBuf,
+    /// Second directory to compare
+    #[arg(value_name = "DIRECTORY_B")]
+    dir_b: PathBuf,
+    /// Also compare file contents using SHA-256
+    #[arg(long)]
+    hash: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <directory_A> <directory_B>", args[0]);
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let dir_a = Path::new(&args[1]);
-    let dir_b = Path::new(&args[2]);
+    let dir_a = cli.dir_a;
+    let dir_b = cli.dir_b;
+    let check_hash = cli.hash;
 
     if !dir_a.is_dir() || !dir_b.is_dir() {
         eprintln!("Both arguments must be valid directories.");
@@ -102,8 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Gather ALL unique direct subdirectories from both sides
-    let all_subdirs: HashSet<PathBuf> = direct_subdirs(dir_a)
-        .union(&direct_subdirs(dir_b))
+    let all_subdirs: HashSet<PathBuf> = direct_subdirs(&dir_a)
+        .union(&direct_subdirs(&dir_b))
         .cloned()
         .collect();
 
@@ -121,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n{CYAN}=== Subdirectory: {} ==={RESET}", label);
 
         match (path_a.is_dir(), path_b.is_dir()) {
-            (true, true) => print_diff(&path_a, &path_b),
+            (true, true) => print_diff(&path_a, &path_b, check_hash),
             (true, false) => println!("  {RED}Present in {} but MISSING entirely in {}{RESET}", dir_a.display(), dir_b.display()),
             (false, true) => println!("  {RED}Present in {} but MISSING entirely in {}{RESET}", dir_b.display(), dir_a.display()),
             _ => (),
